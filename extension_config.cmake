@@ -4,6 +4,7 @@
 duckdb_extension_load(quickjs
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     LOAD_TESTS
+    EXTENSION_VERSION "2025120401"
 )
 
 # Any extra extensions that should be built
