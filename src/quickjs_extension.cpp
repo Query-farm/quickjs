@@ -10,13 +10,184 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
-#ifndef DUCKDB_CPP_EXTENSION_ENTRY
-#include "duckdb/main/extension_util.hpp"
-#endif
 
 #include "quickjs.h"
 
 namespace duckdb {
+
+//===--------------------------------------------------------------------===//
+// RAII Wrappers for QuickJS Resources
+//===--------------------------------------------------------------------===//
+
+// RAII wrapper for JSRuntime - ensures proper cleanup including double GC
+class QuickJSRuntime {
+public:
+	QuickJSRuntime() : rt(JS_NewRuntime()) {
+		if (!rt) {
+			throw IOException("Failed to create QuickJS runtime.");
+		}
+	}
+
+	~QuickJSRuntime() {
+		if (rt) {
+			// Run GC twice to ensure complete cleanup of reference cycles
+			JS_RunGC(rt);
+			JS_RunGC(rt);
+			JS_FreeRuntime(rt);
+		}
+	}
+
+	// Non-copyable
+	QuickJSRuntime(const QuickJSRuntime &) = delete;
+	QuickJSRuntime &operator=(const QuickJSRuntime &) = delete;
+
+	// Moveable
+	QuickJSRuntime(QuickJSRuntime &&other) noexcept : rt(other.rt) {
+		other.rt = nullptr;
+	}
+
+	QuickJSRuntime &operator=(QuickJSRuntime &&other) noexcept {
+		if (this != &other) {
+			if (rt) {
+				JS_RunGC(rt);
+				JS_RunGC(rt);
+				JS_FreeRuntime(rt);
+			}
+			rt = other.rt;
+			other.rt = nullptr;
+		}
+		return *this;
+	}
+
+	JSRuntime *Get() const {
+		return rt;
+	}
+
+private:
+	JSRuntime *rt;
+};
+
+// RAII wrapper for JSContext - ensures proper cleanup
+class QuickJSContext {
+public:
+	explicit QuickJSContext(QuickJSRuntime &runtime) : ctx(JS_NewContext(runtime.Get())) {
+		if (!ctx) {
+			throw IOException("Failed to create QuickJS context.");
+		}
+	}
+
+	~QuickJSContext() {
+		if (ctx) {
+			JS_FreeContext(ctx);
+		}
+	}
+
+	// Non-copyable
+	QuickJSContext(const QuickJSContext &) = delete;
+	QuickJSContext &operator=(const QuickJSContext &) = delete;
+
+	// Moveable
+	QuickJSContext(QuickJSContext &&other) noexcept : ctx(other.ctx) {
+		other.ctx = nullptr;
+	}
+
+	QuickJSContext &operator=(QuickJSContext &&other) noexcept {
+		if (this != &other) {
+			if (ctx) {
+				JS_FreeContext(ctx);
+			}
+			ctx = other.ctx;
+			other.ctx = nullptr;
+		}
+		return *this;
+	}
+
+	JSContext *Get() const {
+		return ctx;
+	}
+
+private:
+	JSContext *ctx;
+};
+
+// RAII wrapper for JSValue - ensures proper cleanup
+class QuickJSValue {
+public:
+	QuickJSValue(JSContext *ctx, JSValue val) : ctx(ctx), val(val) {
+	}
+
+	~QuickJSValue() {
+		if (ctx) {
+			JS_FreeValue(ctx, val);
+		}
+	}
+
+	// Non-copyable
+	QuickJSValue(const QuickJSValue &) = delete;
+	QuickJSValue &operator=(const QuickJSValue &) = delete;
+
+	// Moveable
+	QuickJSValue(QuickJSValue &&other) noexcept : ctx(other.ctx), val(other.val) {
+		other.ctx = nullptr;
+		other.val = JS_UNDEFINED;
+	}
+
+	QuickJSValue &operator=(QuickJSValue &&other) noexcept {
+		if (this != &other) {
+			if (ctx) {
+				JS_FreeValue(ctx, val);
+			}
+			ctx = other.ctx;
+			val = other.val;
+			other.ctx = nullptr;
+			other.val = JS_UNDEFINED;
+		}
+		return *this;
+	}
+
+	JSValue Get() const {
+		return val;
+	}
+
+	JSValue Release() {
+		ctx = nullptr;
+		return val;
+	}
+
+	bool IsException() const {
+		return JS_IsException(val);
+	}
+
+	bool IsFunction() const {
+		return JS_IsFunction(ctx, val);
+	}
+
+	bool IsArray() const {
+		return JS_IsArray(val);
+	}
+
+private:
+	JSContext *ctx;
+	JSValue val;
+};
+
+// Helper to extract and throw JS exception
+static void ThrowJSException(JSContext *ctx, const std::string &prefix = "") {
+	JSValue exception = JS_GetException(ctx);
+	const char *exception_c_str = JS_ToCString(ctx, exception);
+	std::string exception_str(exception_c_str);
+	JS_FreeCString(ctx, exception_c_str);
+	JS_FreeValue(ctx, exception);
+	if (prefix.empty()) {
+		throw InvalidInputException(exception_str);
+	} else {
+		throw InvalidInputException("%s: %s", prefix, exception_str);
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Bind Data and Global State Classes
+//===--------------------------------------------------------------------===//
 
 // Add the bind data and global state classes
 class QuickJSTableBindData : public TableFunctionData {
@@ -77,162 +248,82 @@ static void QuickJSEval(DataChunk &args, ExpressionState &state, Vector &result)
 			continue;
 		}
 
-		JSRuntime *rt = JS_NewRuntime();
-		if (!rt) {
-			throw IOException("Failed to create QuickJS runtime.");
-		}
-		
-		JSContext *ctx = JS_NewContext(rt);
-		if (!ctx) {
-			JS_FreeRuntime(rt);
-			throw IOException("Failed to create QuickJS context.");
-		}
+		QuickJSRuntime runtime;
+		QuickJSContext context(runtime);
+		JSContext *ctx = context.Get();
 
 		// Create a fresh global object to ensure isolation
-		JSValue global_obj = JS_NewObject(ctx);
-		JS_SetPropertyStr(ctx, global_obj, "console", JS_NewObject(ctx));
+		QuickJSValue global_obj(ctx, JS_NewObject(ctx));
+		JS_SetPropertyStr(ctx, global_obj.Get(), "console", JS_NewObject(ctx));
 
 		auto script = script_data[i];
-		JSValue func = JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
+		QuickJSValue func(ctx, JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
-		if (JS_IsException(func)) {
-			JSValue exception = JS_GetException(ctx);
-			const char *exception_c_str = JS_ToCString(ctx, exception);
-			std::string exception_str(exception_c_str);
-			JS_FreeCString(ctx, exception_c_str);
-			JS_FreeValue(ctx, exception);
-			JS_FreeValue(ctx, func);
-			JS_FreeValue(ctx, global_obj);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-			throw InvalidInputException(exception_str);
+		if (func.IsException()) {
+			ThrowJSException(ctx);
 		}
 
-		if (!JS_IsFunction(ctx, func)) {
-			JS_FreeValue(ctx, func);
-			JS_FreeValue(ctx, global_obj);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-			throw InvalidInputException("First argument to js_eval must be a function");
+		if (!func.IsFunction()) {
+			throw InvalidInputException("First argument to quickjs_eval must be a function");
 		}
 
+		// Convert arguments to JS values
 		idx_t n_js_args = args.ColumnCount() - 1;
-		std::vector<JSValue> js_args;
+		std::vector<QuickJSValue> js_args;
+		std::vector<JSValue> js_arg_values;
 		js_args.reserve(n_js_args);
+		js_arg_values.reserve(n_js_args);
 		for (idx_t j = 0; j < n_js_args; j++) {
 			auto val = args.data[j + 1].GetValue(i);
-			js_args.push_back(DuckDBValueToJSValue(ctx, val));
+			js_args.emplace_back(ctx, DuckDBValueToJSValue(ctx, val));
+			js_arg_values.push_back(js_args.back().Get());
 		}
 
-		JSValue js_result = JS_Call(ctx, func, global_obj, n_js_args, js_args.data());
+		QuickJSValue js_result(ctx, JS_Call(ctx, func.Get(), global_obj.Get(), n_js_args, js_arg_values.data()));
 
-		for (auto &arg : js_args) {
-			JS_FreeValue(ctx, arg);
-		}
-		JS_FreeValue(ctx, func);
-		JS_FreeValue(ctx, global_obj);
-
-		if (JS_IsException(js_result)) {
-			JSValue exception = JS_GetException(ctx);
-			const char *exception_c_str = JS_ToCString(ctx, exception);
-			std::string exception_str(exception_c_str);
-			JS_FreeCString(ctx, exception_c_str);
-			JS_FreeValue(ctx, exception);
-			JS_FreeValue(ctx, js_result);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-			throw InvalidInputException(exception_str);
+		if (js_result.IsException()) {
+			ThrowJSException(ctx);
 		}
 
-		JSValue json_string_val = JS_JSONStringify(ctx, js_result, JS_UNDEFINED, JS_UNDEFINED);
-		JS_FreeValue(ctx, js_result);
+		QuickJSValue json_string_val(ctx, JS_JSONStringify(ctx, js_result.Get(), JS_UNDEFINED, JS_UNDEFINED));
 
-		if (JS_IsException(json_string_val)) {
-			JSValue exception = JS_GetException(ctx);
-			const char *exception_c_str = JS_ToCString(ctx, exception);
-			std::string exception_str(exception_c_str);
-			JS_FreeCString(ctx, exception_c_str);
-			JS_FreeValue(ctx, exception);
-			JS_FreeValue(ctx, json_string_val);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-			throw InvalidInputException("Failed to stringify result to JSON: %s", exception_str);
+		if (json_string_val.IsException()) {
+			ThrowJSException(ctx, "Failed to stringify result to JSON");
 		}
 
 		size_t len;
-		const char *json_c_str = JS_ToCStringLen(ctx, &len, json_string_val);
+		const char *json_c_str = JS_ToCStringLen(ctx, &len, json_string_val.Get());
 		result_data[i] = StringVector::AddString(result, json_c_str, len);
 		JS_FreeCString(ctx, json_c_str);
-		JS_FreeValue(ctx, json_string_val);
-
-		JS_FreeContext(ctx);
-		JS_RunGC(rt);
-		JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-		JS_FreeRuntime(rt);
 	}
 }
 
 static void QuickJSExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &script_vector = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(script_vector, result, args.size(), [&](string_t script) {
-		JSRuntime *rt = JS_NewRuntime();
-		if (!rt) {
-			throw IOException("Failed to create QuickJS runtime.");
-		}
-		
-		JSContext *ctx = JS_NewContext(rt);
-		if (!ctx) {
-			JS_FreeRuntime(rt);
-			throw IOException("Failed to create QuickJS context.");
-		}
-		
+		QuickJSRuntime runtime;
+		QuickJSContext context(runtime);
+		JSContext *ctx = context.Get();
+
 		// Create a fresh global object to ensure isolation
-		JSValue global_obj = JS_NewObject(ctx);
-		JS_SetPropertyStr(ctx, global_obj, "console", JS_NewObject(ctx));
+		QuickJSValue global_obj(ctx, JS_NewObject(ctx));
+		JS_SetPropertyStr(ctx, global_obj.Get(), "console", JS_NewObject(ctx));
 
-		JSValue val = JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
+		QuickJSValue val(ctx, JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
-		if (JS_IsException(val)) {
-			JSValue exception = JS_GetException(ctx);
-			const char *exception_c_str = JS_ToCString(ctx, exception);
-			std::string exception_str(exception_c_str);
-			JS_FreeCString(ctx, exception_c_str);
-
-			JS_FreeValue(ctx, exception);
-			JS_FreeValue(ctx, val);
-			JS_FreeValue(ctx, global_obj);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-
-			throw InvalidInputException(exception_str);
+		if (val.IsException()) {
+			ThrowJSException(ctx);
 		}
 
-		const char *c_str = JS_ToCString(ctx, val);
+		const char *c_str = JS_ToCString(ctx, val.Get());
 		string_t result_str = StringVector::AddString(result, c_str);
 		JS_FreeCString(ctx, c_str);
 
-		JS_FreeValue(ctx, val);
-		JS_FreeValue(ctx, global_obj);
-		JS_FreeContext(ctx);
-		JS_RunGC(rt);
-		JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-		JS_FreeRuntime(rt);
 		return result_str;
 	});
 }
 
 static void QuickJSTableFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<QuickJSTableBindData>();
 	auto &state = data_p.global_state->Cast<QuickJSTableGlobalState>();
 
 	if (state.current_index >= state.results.size()) {
@@ -287,21 +378,13 @@ static unique_ptr<GlobalTableFunctionState> QuickJSTableInit(ClientContext &cont
 	auto &bind_data = input.bind_data->Cast<QuickJSTableBindData>();
 	auto result = make_uniq<QuickJSTableGlobalState>();
 
-	// Execute the JavaScript code and collect results
-	JSRuntime *rt = JS_NewRuntime();
-	if (!rt) {
-		throw IOException("Failed to create QuickJS runtime.");
-	}
-	
-	JSContext *ctx = JS_NewContext(rt);
-	if (!ctx) {
-		JS_FreeRuntime(rt);
-		throw IOException("Failed to create QuickJS context.");
-	}
+	QuickJSRuntime runtime;
+	QuickJSContext js_context(runtime);
+	JSContext *ctx = js_context.Get();
 
 	// Create a fresh global object to ensure isolation
-	JSValue global_obj = JS_NewObject(ctx);
-	JS_SetPropertyStr(ctx, global_obj, "console", JS_NewObject(ctx));
+	QuickJSValue global_obj(ctx, JS_NewObject(ctx));
+	JS_SetPropertyStr(ctx, global_obj.Get(), "console", JS_NewObject(ctx));
 
 	// Create a function that takes the parameters and returns the result
 	std::string js_function_code = "(function(";
@@ -310,165 +393,135 @@ static unique_ptr<GlobalTableFunctionState> QuickJSTableInit(ClientContext &cont
 		js_function_code += "arg" + std::to_string(i);
 	}
 	js_function_code += ") { ";
-	
+
 	// Parse JSON strings for the first parameter if it's a string (likely an array/object)
 	if (!bind_data.parameters.empty() && bind_data.parameters[0].type() == LogicalType::VARCHAR) {
 		js_function_code += "let parsed_arg0 = JSON.parse(arg0); ";
 	}
-	
+
 	js_function_code += "return " + bind_data.js_code + "; })";
 
 	// Compile the function
-	JSValue func_val = JS_Eval(ctx, js_function_code.c_str(), js_function_code.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
-	if (JS_IsException(func_val)) {
-		JSValue exception = JS_GetException(ctx);
-		const char *exception_c_str = JS_ToCString(ctx, exception);
-		std::string exception_str(exception_c_str);
-		JS_FreeCString(ctx, exception_c_str);
-		JS_FreeValue(ctx, exception);
-		JS_FreeValue(ctx, func_val);
-		JS_FreeValue(ctx, global_obj);
-		JS_FreeContext(ctx);
-		JS_RunGC(rt);
-		JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-		JS_FreeRuntime(rt);
-		throw InvalidInputException("Failed to compile JavaScript function: %s", exception_str);
+	QuickJSValue func_val(ctx, JS_Eval(ctx, js_function_code.c_str(), js_function_code.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+	if (func_val.IsException()) {
+		ThrowJSException(ctx, "Failed to compile JavaScript function");
 	}
 
 	// Convert parameters to JavaScript values
-	vector<JSValue> js_args;
+	std::vector<QuickJSValue> js_args;
+	std::vector<JSValue> js_arg_values;
 	for (const auto &param : bind_data.parameters) {
-		js_args.push_back(DuckDBValueToJSValue(ctx, param));
+		js_args.emplace_back(ctx, DuckDBValueToJSValue(ctx, param));
+		js_arg_values.push_back(js_args.back().Get());
 	}
 
 	// Call the function
-	JSValue val = JS_Call(ctx, func_val, global_obj, js_args.size(), js_args.data());
+	QuickJSValue val(ctx, JS_Call(ctx, func_val.Get(), global_obj.Get(), js_arg_values.size(), js_arg_values.data()));
 
-	// Clean up function and arguments
-	JS_FreeValue(ctx, func_val);
-	for (auto &arg : js_args) {
-		JS_FreeValue(ctx, arg);
-	}
-
-	if (JS_IsException(val)) {
-		JSValue exception = JS_GetException(ctx);
-		const char *exception_c_str = JS_ToCString(ctx, exception);
-		std::string exception_str(exception_c_str);
-		JS_FreeCString(ctx, exception_c_str);
-		JS_FreeValue(ctx, exception);
-		JS_FreeValue(ctx, val);
-		JS_FreeValue(ctx, global_obj);
-		JS_FreeContext(ctx);
-		JS_RunGC(rt);
-		JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-		JS_FreeRuntime(rt);
-		throw InvalidInputException(exception_str);
+	if (val.IsException()) {
+		ThrowJSException(ctx);
 	}
 
 	// Check if the result is an array
-	if (!JS_IsArray(val)) {
-		JS_FreeValue(ctx, val);
-		JS_FreeValue(ctx, global_obj);
-		JS_FreeContext(ctx);
-		JS_RunGC(rt);
-		JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-		JS_FreeRuntime(rt);
+	if (!val.IsArray()) {
 		throw InvalidInputException("JavaScript code must return an array");
 	}
 
 	// Get array length
 	JSAtom length_atom = JS_NewAtom(ctx, "length");
-	JSValue length_val = JS_GetProperty(ctx, val, length_atom);
+	JSValue length_val = JS_GetProperty(ctx, val.Get(), length_atom);
 	int32_t length = JS_VALUE_GET_INT(length_val);
 	JS_FreeValue(ctx, length_val);
 	JS_FreeAtom(ctx, length_atom);
 
 	// Extract each array element as a separate row
 	for (int32_t i = 0; i < length; i++) {
-		JSValue element = JS_GetPropertyUint32(ctx, val, i);
-		
-		JSValue json_string_val = JS_JSONStringify(ctx, element, JS_UNDEFINED, JS_UNDEFINED);
-		JS_FreeValue(ctx, element);
+		QuickJSValue element(ctx, JS_GetPropertyUint32(ctx, val.Get(), i));
+		QuickJSValue json_string_val(ctx, JS_JSONStringify(ctx, element.Get(), JS_UNDEFINED, JS_UNDEFINED));
 
-		if (JS_IsException(json_string_val)) {
-			JSValue exception = JS_GetException(ctx);
-			const char *exception_c_str = JS_ToCString(ctx, exception);
-			std::string exception_str(exception_c_str);
-			JS_FreeCString(ctx, exception_c_str);
-			JS_FreeValue(ctx, exception);
-			JS_FreeValue(ctx, json_string_val);
-			JS_FreeValue(ctx, val);
-			JS_FreeValue(ctx, global_obj);
-			JS_FreeContext(ctx);
-			JS_RunGC(rt);
-			JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-			JS_FreeRuntime(rt);
-			throw InvalidInputException("Failed to stringify result to JSON: %s", exception_str);
+		if (json_string_val.IsException()) {
+			ThrowJSException(ctx, "Failed to stringify result to JSON");
 		}
 
 		size_t len;
-		const char *json_c_str = JS_ToCStringLen(ctx, &len, json_string_val);
+		const char *json_c_str = JS_ToCStringLen(ctx, &len, json_string_val.Get());
 		std::string json_str(json_c_str, len);
 		JS_FreeCString(ctx, json_c_str);
-		JS_FreeValue(ctx, json_string_val);
 
 		result->results.push_back(json_str);
 	}
 
-	JS_FreeValue(ctx, val);
-	JS_FreeValue(ctx, global_obj);
-	JS_FreeContext(ctx);
-	JS_RunGC(rt);
-	JS_RunGC(rt);  // Run GC twice to ensure complete cleanup
-	JS_FreeRuntime(rt);
 	return std::move(result);
 }
 
-#ifdef DUCKDB_CPP_EXTENSION_ENTRY
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("QuickJS embedded scripting language");
 
+	//===--------------------------------------------------------------------===//
+	// quickjs(code) - Scalar function that executes JavaScript and returns VARCHAR
+	//===--------------------------------------------------------------------===//
+	ScalarFunctionSet quickjs_set("quickjs");
+
 	auto quickjs_scalar_function =
-	    ScalarFunction("quickjs", {LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
-	loader.RegisterFunction(quickjs_scalar_function);
+	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
+	quickjs_set.AddFunction(quickjs_scalar_function);
+
+	CreateScalarFunctionInfo quickjs_info(quickjs_set);
+	FunctionDescription quickjs_desc;
+	quickjs_desc.description = "Execute JavaScript code and return the result as a string";
+	quickjs_desc.parameter_types = {LogicalType::VARCHAR};
+	quickjs_desc.parameter_names = {"code"};
+	quickjs_desc.examples = {"quickjs('1 + 2')", "quickjs('\"hello\".toUpperCase()')"};
+	quickjs_desc.categories = {"text"};
+	quickjs_info.descriptions.push_back(quickjs_desc);
+
+	loader.RegisterFunction(quickjs_info);
+
+	//===--------------------------------------------------------------------===//
+	// quickjs_eval(function, ...args) - Scalar function that executes a JS function with arguments
+	//===--------------------------------------------------------------------===//
+	ScalarFunctionSet quickjs_eval_set("quickjs_eval");
 
 	auto quickjs_eval_function =
-	    ScalarFunction("quickjs_eval", {LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
+	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
 	quickjs_eval_function.varargs = LogicalType::ANY;
-	loader.RegisterFunction(quickjs_eval_function);
+	quickjs_eval_set.AddFunction(quickjs_eval_function);
 
-	// Register the table function
-	auto quickjs_table_function = TableFunction("quickjs", {LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
+	CreateScalarFunctionInfo quickjs_eval_info(quickjs_eval_set);
+	FunctionDescription quickjs_eval_desc;
+	quickjs_eval_desc.description = "Execute a JavaScript function with the provided arguments and return the result as JSON";
+	quickjs_eval_desc.parameter_types = {LogicalType::VARCHAR};
+	quickjs_eval_desc.parameter_names = {"function"};
+	quickjs_eval_desc.examples = {"quickjs_eval('(a, b) => a + b', 1, 2)", "quickjs_eval('(x) => x * 2', 21)"};
+	quickjs_eval_desc.categories = {"text"};
+	quickjs_eval_info.descriptions.push_back(quickjs_eval_desc);
+
+	loader.RegisterFunction(quickjs_eval_info);
+
+	//===--------------------------------------------------------------------===//
+	// quickjs(code, ...args) - Table function that returns array elements as rows
+	//===--------------------------------------------------------------------===//
+	TableFunctionSet quickjs_table_set("quickjs");
+
+	auto quickjs_table_function = TableFunction({LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
 	quickjs_table_function.varargs = LogicalType::ANY;
-	loader.RegisterFunction(quickjs_table_function);
+	quickjs_table_set.AddFunction(quickjs_table_function);
+
+	CreateTableFunctionInfo quickjs_table_info(quickjs_table_set);
+	FunctionDescription quickjs_table_desc;
+	quickjs_table_desc.description = "Execute JavaScript code that returns an array, with each element becoming a row";
+	quickjs_table_desc.parameter_types = {LogicalType::VARCHAR};
+	quickjs_table_desc.parameter_names = {"code"};
+	quickjs_table_desc.examples = {"SELECT * FROM quickjs('[1, 2, 3].map(x => x * 2)')"};
+	quickjs_table_desc.categories = {"table"};
+	quickjs_table_info.descriptions.push_back(quickjs_table_desc);
+
+	loader.RegisterFunction(quickjs_table_info);
 }
-#else
-static void LoadInternal(DatabaseInstance &instance) {
-	auto quickjs_scalar_function =
-	    ScalarFunction("quickjs", {LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
-	ExtensionUtil::RegisterFunction(instance, quickjs_scalar_function);
 
-	auto quickjs_eval_function =
-	    ScalarFunction("quickjs_eval", {LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
-	quickjs_eval_function.varargs = LogicalType::ANY;
-	ExtensionUtil::RegisterFunction(instance, quickjs_eval_function);
-
-	// Register the table function
-	auto quickjs_table_function = TableFunction("quickjs", {LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
-	quickjs_table_function.varargs = LogicalType::ANY;
-	ExtensionUtil::RegisterFunction(instance, quickjs_table_function);
-}
-#endif
-
-#ifdef DUCKDB_CPP_EXTENSION_ENTRY
 void QuickjsExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
-#else
-void QuickjsExtension::Load(DuckDB &db) {
-	LoadInternal(*db.instance);
-}
-#endif
 
 std::string QuickjsExtension::Name() {
 	return "quickjs";
@@ -486,16 +539,9 @@ std::string QuickjsExtension::Version() const {
 
 extern "C" {
 
-#ifdef DUCKDB_CPP_EXTENSION_ENTRY
 DUCKDB_CPP_EXTENSION_ENTRY(quickjs, loader) {
 	duckdb::LoadInternal(loader);
 }
-#else
-DUCKDB_EXTENSION_API void quickjs_init(duckdb::DatabaseInstance &db) {
-	duckdb::DuckDB db_wrapper(db);
-	db_wrapper.LoadExtension<duckdb::QuickjsExtension>();
-}
-#endif
 
 DUCKDB_EXTENSION_API const char *quickjs_version() {
 	return duckdb::DuckDB::LibraryVersion();
