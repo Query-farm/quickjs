@@ -256,8 +256,9 @@ static void QuickJSEval(DataChunk &args, ExpressionState &state, Vector &result)
 		QuickJSValue global_obj(ctx, JS_NewObject(ctx));
 		JS_SetPropertyStr(ctx, global_obj.Get(), "console", JS_NewObject(ctx));
 
-		auto script = script_data[i];
-		QuickJSValue func(ctx, JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+		// Convert to std::string to ensure proper null-termination and avoid string_t inline storage issues
+		std::string script_str = script_data[i].GetString();
+		QuickJSValue func(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
 		if (func.IsException()) {
 			ThrowJSException(ctx);
@@ -309,7 +310,9 @@ static void QuickJSExecute(DataChunk &args, ExpressionState &state, Vector &resu
 		QuickJSValue global_obj(ctx, JS_NewObject(ctx));
 		JS_SetPropertyStr(ctx, global_obj.Get(), "console", JS_NewObject(ctx));
 
-		QuickJSValue val(ctx, JS_Eval(ctx, script.GetData(), script.GetSize(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+		// Convert to std::string to ensure proper null-termination and avoid string_t inline storage issues
+		std::string script_str = script.GetString();
+		QuickJSValue val(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
 		if (val.IsException()) {
 			ThrowJSException(ctx);
@@ -464,6 +467,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto quickjs_scalar_function =
 	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
+	quickjs_scalar_function.stability = FunctionStability::VOLATILE;
 	quickjs_set.AddFunction(quickjs_scalar_function);
 
 	CreateScalarFunctionInfo quickjs_info(quickjs_set);
@@ -485,6 +489,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto quickjs_eval_function =
 	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
 	quickjs_eval_function.varargs = LogicalType::ANY;
+	quickjs_eval_function.stability = FunctionStability::VOLATILE;
 	quickjs_eval_set.AddFunction(quickjs_eval_function);
 
 	CreateScalarFunctionInfo quickjs_eval_info(quickjs_eval_set);
