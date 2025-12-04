@@ -9,7 +9,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-
+#include "query_farm_telemetry.hpp"
 
 #include "quickjs.h"
 
@@ -194,7 +194,7 @@ class QuickJSTableBindData : public TableFunctionData {
 public:
 	QuickJSTableBindData() {
 	}
-	
+
 	std::string js_code;
 	vector<Value> parameters;
 };
@@ -258,7 +258,8 @@ static void QuickJSEval(DataChunk &args, ExpressionState &state, Vector &result)
 
 		// Convert to std::string to ensure proper null-termination and avoid string_t inline storage issues
 		std::string script_str = script_data[i].GetString();
-		QuickJSValue func(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+		QuickJSValue func(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>",
+		                               JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
 		if (func.IsException()) {
 			ThrowJSException(ctx);
@@ -312,7 +313,8 @@ static void QuickJSExecute(DataChunk &args, ExpressionState &state, Vector &resu
 
 		// Convert to std::string to ensure proper null-termination and avoid string_t inline storage issues
 		std::string script_str = script.GetString();
-		QuickJSValue val(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+		QuickJSValue val(ctx, JS_Eval(ctx, script_str.c_str(), script_str.length(), "<eval>",
+		                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 
 		if (val.IsException()) {
 			ThrowJSException(ctx);
@@ -361,7 +363,7 @@ static unique_ptr<FunctionData> QuickJSTableBind(ClientContext &context, TableFu
 	names.push_back("result");
 
 	auto bind_data = make_uniq<QuickJSTableBindData>();
-	
+
 	// Extract the JavaScript code from the first argument
 	if (!input.inputs[0].IsNull()) {
 		bind_data->js_code = input.inputs[0].GetValue<string>();
@@ -392,7 +394,8 @@ static unique_ptr<GlobalTableFunctionState> QuickJSTableInit(ClientContext &cont
 	// Create a function that takes the parameters and returns the result
 	std::string js_function_code = "(function(";
 	for (idx_t i = 0; i < bind_data.parameters.size(); i++) {
-		if (i > 0) js_function_code += ", ";
+		if (i > 0)
+			js_function_code += ", ";
 		js_function_code += "arg" + std::to_string(i);
 	}
 	js_function_code += ") { ";
@@ -405,7 +408,8 @@ static unique_ptr<GlobalTableFunctionState> QuickJSTableInit(ClientContext &cont
 	js_function_code += "return " + bind_data.js_code + "; })";
 
 	// Compile the function
-	QuickJSValue func_val(ctx, JS_Eval(ctx, js_function_code.c_str(), js_function_code.length(), "<eval>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
+	QuickJSValue func_val(ctx, JS_Eval(ctx, js_function_code.c_str(), js_function_code.length(), "<eval>",
+	                                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT));
 	if (func_val.IsException()) {
 		ThrowJSException(ctx, "Failed to compile JavaScript function");
 	}
@@ -465,8 +469,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 	ScalarFunctionSet quickjs_set("quickjs");
 
-	auto quickjs_scalar_function =
-	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
+	auto quickjs_scalar_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
 	quickjs_scalar_function.stability = FunctionStability::VOLATILE;
 	quickjs_set.AddFunction(quickjs_scalar_function);
 
@@ -486,15 +489,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 	ScalarFunctionSet quickjs_eval_set("quickjs_eval");
 
-	auto quickjs_eval_function =
-	    ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
+	auto quickjs_eval_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
 	quickjs_eval_function.varargs = LogicalType::ANY;
 	quickjs_eval_function.stability = FunctionStability::VOLATILE;
 	quickjs_eval_set.AddFunction(quickjs_eval_function);
 
 	CreateScalarFunctionInfo quickjs_eval_info(quickjs_eval_set);
 	FunctionDescription quickjs_eval_desc;
-	quickjs_eval_desc.description = "Execute a JavaScript function with the provided arguments and return the result as JSON";
+	quickjs_eval_desc.description =
+	    "Execute a JavaScript function with the provided arguments and return the result as JSON";
 	quickjs_eval_desc.parameter_types = {LogicalType::VARCHAR};
 	quickjs_eval_desc.parameter_names = {"function"};
 	quickjs_eval_desc.examples = {"quickjs_eval('(a, b) => a + b', 1, 2)", "quickjs_eval('(x) => x * 2', 21)"};
@@ -508,7 +511,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 	TableFunctionSet quickjs_table_set("quickjs");
 
-	auto quickjs_table_function = TableFunction({LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
+	auto quickjs_table_function =
+	    TableFunction({LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
 	quickjs_table_function.varargs = LogicalType::ANY;
 	quickjs_table_set.AddFunction(quickjs_table_function);
 
@@ -522,6 +526,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	quickjs_table_info.descriptions.push_back(quickjs_table_desc);
 
 	loader.RegisterFunction(quickjs_table_info);
+
+	QueryFarmSendTelemetry(loader, "quickjs", "2025120401");
 }
 
 void QuickjsExtension::Load(ExtensionLoader &loader) {
