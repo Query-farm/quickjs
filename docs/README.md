@@ -7,10 +7,6 @@
   </a>
 </p>
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/46a5c546-7e9b-42c7-87f4-bc8defe674e0" width="250" />
-</p>
-
 # DuckDB QuickJS Extension
 
 [![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/quickjs.html)
