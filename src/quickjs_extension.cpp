@@ -527,7 +527,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(quickjs_table_info);
 
-	QueryFarmSendTelemetry(loader, "quickjs", "2025120401");
+	QueryFarmSendTelemetry(loader, "quickjs", "2026072501");
 }
 
 void QuickjsExtension::Load(ExtensionLoader &loader) {
