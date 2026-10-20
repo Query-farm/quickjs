@@ -9,6 +9,8 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/common/vector/flat_vector.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
 #include "query_farm_telemetry.hpp"
 
 #include "quickjs.h"
@@ -234,13 +236,13 @@ static void QuickJSEval(DataChunk &args, ExpressionState &state, Vector &result)
 	auto count = args.size();
 
 	Vector &script_vector = args.data[0];
-	script_vector.Flatten(count);
+	script_vector.Flatten();
 	auto script_data = FlatVector::GetData<string_t>(script_vector);
 	auto &script_validity = FlatVector::Validity(script_vector);
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<string_t>(result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result);
+	auto &result_validity = FlatVector::ValidityMutable(result);
 
 	for (idx_t i = 0; i < count; i++) {
 		if (!script_validity.RowIsValid(i)) {
@@ -302,7 +304,7 @@ static void QuickJSEval(DataChunk &args, ExpressionState &state, Vector &result)
 
 static void QuickJSExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &script_vector = args.data[0];
-	UnaryExecutor::Execute<string_t, string_t>(script_vector, result, args.size(), [&](string_t script) {
+	UnaryExecutor::Execute<string_t, string_t>(script_vector, result, [&](string_t script) {
 		QuickJSRuntime runtime;
 		QuickJSContext context(runtime);
 		JSContext *ctx = context.Get();
@@ -332,17 +334,17 @@ static void QuickJSTableFunction(ClientContext &context, TableFunctionInput &dat
 	auto &state = data_p.global_state->Cast<QuickJSTableGlobalState>();
 
 	if (state.current_index >= state.results.size()) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 
 	idx_t chunk_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, state.results.size() - state.current_index);
-	output.SetCardinality(chunk_size);
+	output.SetChildCardinality(chunk_size);
 
 	// For now, we'll return a single column with the JSON string representation
 	// In the future, we could parse the JSON and create multiple columns
 	auto &result_vector = output.data[0];
-	auto result_data = FlatVector::GetData<string_t>(result_vector);
+	auto result_data = FlatVector::GetDataMutable<string_t>(result_vector);
 
 	for (idx_t i = 0; i < chunk_size; i++) {
 		result_data[i] = StringVector::AddString(result_vector, state.results[state.current_index + i]);
@@ -352,7 +354,7 @@ static void QuickJSTableFunction(ClientContext &context, TableFunctionInput &dat
 }
 
 static unique_ptr<FunctionData> QuickJSTableBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// Check that we have at least one argument (the JavaScript code)
 	if (input.inputs.size() < 1) {
 		throw BinderException("quickjs() expects at least one argument (JavaScript code)");
@@ -470,7 +472,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet quickjs_set("quickjs");
 
 	auto quickjs_scalar_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
-	quickjs_scalar_function.stability = FunctionStability::VOLATILE;
+	quickjs_scalar_function.SetVolatile();
+	quickjs_scalar_function.SetFallible();
 	quickjs_set.AddFunction(quickjs_scalar_function);
 
 	CreateScalarFunctionInfo quickjs_info(quickjs_set);
@@ -490,8 +493,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScalarFunctionSet quickjs_eval_set("quickjs_eval");
 
 	auto quickjs_eval_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
-	quickjs_eval_function.varargs = LogicalType::ANY;
-	quickjs_eval_function.stability = FunctionStability::VOLATILE;
+	quickjs_eval_function.GetSignature().AddArgs("args", LogicalType::ANY);
+	quickjs_eval_function.SetVolatile();
+	quickjs_eval_function.SetFallible();
 	quickjs_eval_set.AddFunction(quickjs_eval_function);
 
 	CreateScalarFunctionInfo quickjs_eval_info(quickjs_eval_set);
@@ -513,7 +517,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	auto quickjs_table_function =
 	    TableFunction({LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
-	quickjs_table_function.varargs = LogicalType::ANY;
+	quickjs_table_function.GetSignature().AddArgs("args", LogicalType::ANY);
 	quickjs_table_set.AddFunction(quickjs_table_function);
 
 	CreateTableFunctionInfo quickjs_table_info(quickjs_table_set);
