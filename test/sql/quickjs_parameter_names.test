@@ -1,0 +1,39 @@
+# name: test/sql/quickjs_parameter_names.test
+# description: every function parameter is reported with a real name, not col0, col1, ...
+# group: [sql]
+
+require quickjs
+
+query IIT
+SELECT function_name, function_type, parameters FROM duckdb_functions()
+WHERE extension_name = 'quickjs'
+ORDER BY function_name, function_type, len(parameters), parameter_types::VARCHAR;
+----
+quickjs	scalar	[code]
+quickjs	table	[code]
+quickjs_eval	scalar	[function]
+
+# No parameter may fall back to a positional colN name
+query I
+SELECT count(*) FROM (SELECT unnest(parameters) AS p FROM duckdb_functions() WHERE extension_name = 'quickjs')
+WHERE regexp_matches(p, '^col[0-9]+$');
+----
+0
+
+# Positional calls work as before
+query I
+SELECT quickjs('1+2;');
+----
+3
+
+query I
+SELECT quickjs_eval('(a, b) => a + b', 1, 2);
+----
+3
+
+query I
+SELECT * FROM quickjs('[1, 2, 3]');
+----
+1
+2
+3

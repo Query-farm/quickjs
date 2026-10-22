@@ -17,6 +17,11 @@
 
 namespace duckdb {
 
+//! A positional-only parameter with a real name (bare types would be reported as col0, col1, ...)
+static FunctionParameter Positional(const char *name, LogicalType type) {
+	return FunctionParameter(name, std::move(type), {}, FunctionParameterKind::POSITIONAL_ONLY);
+}
+
 //===--------------------------------------------------------------------===//
 // RAII Wrappers for QuickJS Resources
 //===--------------------------------------------------------------------===//
@@ -471,7 +476,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 	ScalarFunctionSet quickjs_set("quickjs");
 
-	auto quickjs_scalar_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, QuickJSExecute);
+	auto quickjs_scalar_function =
+	    ScalarFunction({Positional("code", LogicalType::VARCHAR)}, LogicalType::VARCHAR, QuickJSExecute);
 	quickjs_scalar_function.SetVolatile();
 	quickjs_scalar_function.SetFallible();
 	quickjs_set.AddFunction(quickjs_scalar_function);
@@ -492,7 +498,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//===--------------------------------------------------------------------===//
 	ScalarFunctionSet quickjs_eval_set("quickjs_eval");
 
-	auto quickjs_eval_function = ScalarFunction({LogicalType::VARCHAR}, LogicalType::JSON(), QuickJSEval);
+	auto quickjs_eval_function =
+	    ScalarFunction({Positional("function", LogicalType::VARCHAR)}, LogicalType::JSON(), QuickJSEval);
 	quickjs_eval_function.GetSignature().AddArgs("args", LogicalType::ANY);
 	quickjs_eval_function.SetVolatile();
 	quickjs_eval_function.SetFallible();
@@ -516,7 +523,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunctionSet quickjs_table_set("quickjs");
 
 	auto quickjs_table_function =
-	    TableFunction({LogicalType::VARCHAR}, QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
+	    TableFunction(FunctionSignature({Positional("code", LogicalType::VARCHAR)}, LogicalType::INVALID),
+	                  QuickJSTableFunction, QuickJSTableBind, QuickJSTableInit);
 	quickjs_table_function.GetSignature().AddArgs("args", LogicalType::ANY);
 	quickjs_table_set.AddFunction(quickjs_table_function);
 
@@ -531,7 +539,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(quickjs_table_info);
 
-	QueryFarmSendTelemetry(loader, "quickjs", "2026102001");
+	QueryFarmSendTelemetry(loader, "quickjs", "2026102101");
 }
 
 void QuickjsExtension::Load(ExtensionLoader &loader) {
