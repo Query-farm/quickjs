@@ -18,6 +18,35 @@ SELECT quickjs('"x".repeat(4000000).length');
 ----
 out of memory (quickjs_memory_limit is 1MB)
 
+# Many small allocations: at the limit QuickJS cannot even allocate the error object (and throws null internally),
+# which must still be reported as running out of memory
+statement error
+SELECT quickjs('let a = []; while (true) a.push({})');
+----
+out of memory (quickjs_memory_limit is 1MB)
+
+statement error
+SELECT quickjs('let m = new Map(); for (let i = 0;; i++) m.set(i, [i])');
+----
+out of memory (quickjs_memory_limit is 1MB)
+
+# ... while a script that throws null itself is not mistaken for that
+statement error
+SELECT quickjs('throw null');
+----
+null
+
+# try/catch cannot swallow the limit, and the engine stays usable afterwards
+statement error
+SELECT quickjs('try { "x".repeat(4000000) } catch (e) {} "swallowed"');
+----
+out of memory (quickjs_memory_limit is 1MB)
+
+query I
+SELECT quickjs('[1, 2, 3].length');
+----
+3
+
 statement error
 SELECT quickjs_eval('(n) => "x".repeat(n).length', 4000000);
 ----

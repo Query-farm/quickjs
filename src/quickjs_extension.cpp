@@ -23,6 +23,10 @@
 #include "quickjs.h"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #if defined(_WIN32)
 #include "duckdb/common/windows.hpp"
@@ -163,9 +167,119 @@ static size_t ComputeStackBudget() {
 // RAII Wrappers for QuickJS Resources
 //===--------------------------------------------------------------------===//
 
+//! Heap allocator for a QuickJS runtime that enforces quickjs_memory_limit itself (instead of JS_SetMemoryLimit) so
+//! that hitting the limit is observable: when QuickJS cannot even allocate the "out of memory" error object it throws
+//! null, and how close to the limit that happens depends on the platform's malloc. Every block carries a small header
+//! holding its size, so accounting is identical on all platforms.
+struct QuickJSAllocator {
+	//! Maximum number of bytes, 0 = unlimited
+	size_t limit = 0;
+	//! Bytes currently allocated (including headers)
+	size_t used = 0;
+	//! Set when an allocation was refused because of the limit
+	bool limit_hit = false;
+
+	//! Extra bytes allowed above the limit while an error is converted to a message
+	static constexpr size_t ERROR_HEADROOM = 1024 * 1024;
+
+	static constexpr size_t HEADER =
+	    alignof(std::max_align_t) > sizeof(size_t) ? alignof(std::max_align_t) : sizeof(size_t);
+
+	bool Reserve(size_t bytes) {
+		if (limit != 0 && (bytes > limit || used > limit - bytes)) {
+			limit_hit = true;
+			return false;
+		}
+		used += bytes;
+		return true;
+	}
+
+	static size_t &BlockSize(void *base) {
+		return *static_cast<size_t *>(base);
+	}
+
+	static void *Base(const void *ptr) {
+		return const_cast<char *>(static_cast<const char *>(ptr)) - HEADER;
+	}
+
+	static void *Malloc(void *opaque, size_t size) {
+		auto &alloc = *static_cast<QuickJSAllocator *>(opaque);
+		if (size > SIZE_MAX - HEADER || !alloc.Reserve(size + HEADER)) {
+			return nullptr;
+		}
+		void *base = std::malloc(size + HEADER);
+		if (!base) {
+			alloc.used -= size + HEADER;
+			return nullptr;
+		}
+		BlockSize(base) = size;
+		return static_cast<char *>(base) + HEADER;
+	}
+
+	static void *Calloc(void *opaque, size_t count, size_t size) {
+		if (size != 0 && count > SIZE_MAX / size) {
+			return nullptr;
+		}
+		auto ptr = Malloc(opaque, count * size);
+		if (ptr) {
+			std::memset(ptr, 0, count * size);
+		}
+		return ptr;
+	}
+
+	static void Free(void *opaque, void *ptr) {
+		if (!ptr) {
+			return;
+		}
+		auto &alloc = *static_cast<QuickJSAllocator *>(opaque);
+		void *base = Base(ptr);
+		alloc.used -= BlockSize(base) + HEADER;
+		std::free(base);
+	}
+
+	static void *Realloc(void *opaque, void *ptr, size_t size) {
+		if (!ptr) {
+			return Malloc(opaque, size);
+		}
+		if (size == 0) {
+			Free(opaque, ptr);
+			return nullptr;
+		}
+		auto &alloc = *static_cast<QuickJSAllocator *>(opaque);
+		if (size > SIZE_MAX - HEADER) {
+			return nullptr;
+		}
+		void *base = Base(ptr);
+		size_t old_size = BlockSize(base);
+		if (size > old_size && !alloc.Reserve(size - old_size)) {
+			return nullptr;
+		}
+		void *new_base = std::realloc(base, size + HEADER);
+		if (!new_base) {
+			if (size > old_size) {
+				alloc.used -= size - old_size;
+			}
+			return nullptr;
+		}
+		if (size < old_size) {
+			alloc.used -= old_size - size;
+		}
+		BlockSize(new_base) = size;
+		return static_cast<char *>(new_base) + HEADER;
+	}
+
+	static size_t UsableSize(const void *ptr) {
+		return ptr ? BlockSize(Base(ptr)) : 0;
+	}
+};
+
+static const JSMallocFunctions QUICKJS_MALLOC_FUNCTIONS = {QuickJSAllocator::Calloc, QuickJSAllocator::Malloc,
+                                                           QuickJSAllocator::Free, QuickJSAllocator::Realloc,
+                                                           QuickJSAllocator::UsableSize};
+
 class QuickJSRuntime {
 public:
-	QuickJSRuntime() : rt(JS_NewRuntime()) {
+	explicit QuickJSRuntime(QuickJSAllocator &allocator) : rt(JS_NewRuntime2(&QUICKJS_MALLOC_FUNCTIONS, &allocator)) {
 		if (!rt) {
 			throw IOException("Failed to create QuickJS runtime.");
 		}
@@ -294,7 +408,8 @@ static string JSStringToUTF8(const char *data, size_t len) {
 
 class QuickJSEngine {
 public:
-	QuickJSEngine(ClientContext &client, QuickJSLimits limits_p) : client(client), limits(std::move(limits_p)) {
+	QuickJSEngine(ClientContext &client, QuickJSLimits limits_p)
+	    : runtime(allocator), client(client), limits(std::move(limits_p)) {
 		JS_SetInterruptHandler(runtime.Get(), InterruptHandler, this);
 	}
 
@@ -307,9 +422,9 @@ public:
 
 	//! Create a context and arm the memory limit (applied after the context exists so the limit covers the script)
 	unique_ptr<QuickJSContext> NewContext() {
-		JS_SetMemoryLimit(runtime.Get(), 0);
+		allocator.limit = 0;
 		auto result = make_uniq<QuickJSContext>(runtime.Get());
-		JS_SetMemoryLimit(runtime.Get(), limits.memory_limit);
+		allocator.limit = limits.memory_limit;
 		return result;
 	}
 
@@ -319,6 +434,7 @@ public:
 		JS_UpdateStackTop(runtime.Get());
 		JS_SetMaxStackSize(runtime.Get(), ComputeStackBudget());
 		interrupt_reason = InterruptReason::NONE;
+		allocator.limit_hit = false;
 		if (limits.timeout_ms > 0) {
 			deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(limits.timeout_ms);
 		}
@@ -372,18 +488,32 @@ public:
 	//! Translate the pending JavaScript exception (or interrupt) into a DuckDB exception
 	[[noreturn]] void ThrowPendingException(JSContext *ctx, const string &prefix = string()) {
 		JSValue exception = JS_GetException(ctx);
+		// Give the conversion a little headroom above the limit: stringifying the error needs some memory (bounded,
+		// since a thrown object's toString() is user code)
+		bool out_of_memory = allocator.limit_hit;
+		if (allocator.limit != 0) {
+			allocator.limit = allocator.limit + MinValue<size_t>(QuickJSAllocator::ERROR_HEADROOM, SIZE_MAX - allocator.limit);
+		}
 		string message;
-		size_t len = 0;
-		const char *c_str = JS_ToCStringLen(ctx, &len, exception);
-		if (c_str) {
-			message = string(c_str, len);
-			JS_FreeCString(ctx, c_str);
+		if (out_of_memory && JS_IsNull(exception)) {
+			// QuickJS could not allocate the error object at the limit and threw null instead
+			message = "InternalError: out of memory";
 		} else {
-			// e.g. a thrown Symbol: ToString throws, discard that secondary exception
-			JS_FreeValue(ctx, JS_GetException(ctx));
-			message = "uncaught JavaScript exception (value cannot be converted to a string)";
+			size_t len = 0;
+			const char *c_str = JS_ToCStringLen(ctx, &len, exception);
+			if (c_str) {
+				message = string(c_str, len);
+				JS_FreeCString(ctx, c_str);
+			} else {
+				// e.g. a thrown Symbol: ToString throws, discard that secondary exception
+				JS_FreeValue(ctx, JS_GetException(ctx));
+				message = out_of_memory ? "InternalError: out of memory"
+				                        : "uncaught JavaScript exception (value cannot be converted to a string)";
+			}
 		}
 		JS_FreeValue(ctx, exception);
+		allocator.limit = limits.memory_limit;
+		allocator.limit_hit = false;
 
 		switch (interrupt_reason) {
 		case InterruptReason::CANCELLED:
@@ -428,6 +558,8 @@ private:
 		return 0;
 	}
 
+	//! Declared before runtime: the runtime frees its memory through the allocator on destruction
+	QuickJSAllocator allocator;
 	QuickJSRuntime runtime;
 	ClientContext &client;
 	QuickJSLimits limits;
