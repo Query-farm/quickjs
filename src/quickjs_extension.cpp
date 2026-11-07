@@ -26,8 +26,6 @@
 
 #if defined(_WIN32)
 #include "duckdb/common/windows.hpp"
-#elif defined(__EMSCRIPTEN__)
-#include <emscripten/stack.h>
 #elif defined(__APPLE__) || defined(__linux__)
 #include <pthread.h>
 #endif
@@ -107,8 +105,6 @@ static uintptr_t CurrentThreadStackLow() {
 	}
 	// The allocation base is the bottom of the reserved stack region; leave room for the guard pages
 	return reinterpret_cast<uintptr_t>(mbi.AllocationBase) + 64 * 1024;
-#elif defined(__EMSCRIPTEN__)
-	return static_cast<uintptr_t>(emscripten_stack_get_end());
 #elif defined(__APPLE__)
 	pthread_t self = pthread_self();
 	auto top = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
@@ -128,6 +124,8 @@ static uintptr_t CurrentThreadStackLow() {
 	}
 	return reinterpret_cast<uintptr_t>(addr);
 #else
+	// Unknown platform (including wasm, where querying the stack would need symbols a side module may not get):
+	// ComputeStackBudget() falls back to a conservative fixed budget
 	return 0;
 #endif
 }
