@@ -1,0 +1,116 @@
+# name: test/sql/quickjs_limits.test
+# description: memory limit, timeout, query interruption and the sandbox
+# group: [quickjs]
+
+require quickjs
+
+# Allocation loops hit the memory limit (default 256MB) instead of exhausting the machine
+statement error
+SELECT quickjs('let a = []; while (true) a.push("xxxxxxxxxxxxxxxx" + a.length)');
+----
+out of memory (quickjs_memory_limit is 256MB)
+
+statement ok
+SET quickjs_memory_limit = '1MB';
+
+statement error
+SELECT quickjs('"x".repeat(4000000).length');
+----
+out of memory (quickjs_memory_limit is 1MB)
+
+statement error
+SELECT quickjs_eval('(n) => "x".repeat(n).length', 4000000);
+----
+out of memory
+
+statement error
+SELECT * FROM quickjs('["x".repeat(4000000).length]');
+----
+out of memory
+
+statement ok
+SET quickjs_memory_limit = 'none';
+
+query I
+SELECT quickjs('"x".repeat(4000000).length');
+----
+4000000
+
+statement ok
+RESET quickjs_memory_limit;
+
+statement error
+SET quickjs_memory_limit = 'bogus';
+----
+Memory must have a number
+
+# Infinite loops are stopped by quickjs_timeout_ms ...
+statement ok
+SET quickjs_timeout_ms = 200;
+
+statement error
+SELECT quickjs('while (true) {}');
+----
+JavaScript execution exceeded quickjs_timeout_ms (200 ms)
+
+statement error
+SELECT quickjs_eval('() => { for (;;) {} }');
+----
+JavaScript execution exceeded quickjs_timeout_ms
+
+statement error
+SELECT * FROM quickjs('while (true) {}');
+----
+JavaScript execution exceeded quickjs_timeout_ms
+
+# ... including async loops driven by the promise job queue
+statement error
+SELECT quickjs('(async () => { while (true) await null })()');
+----
+JavaScript execution exceeded quickjs_timeout_ms
+
+# Ordinary scripts are unaffected
+query I
+SELECT quickjs('let s = 0; for (let i = 0; i < 1000; i++) s += i; s');
+----
+499500
+
+statement ok
+SET quickjs_timeout_ms = 0;
+
+statement error
+SET quickjs_timeout_ms = -1;
+----
+must be >= 0
+
+# ... and by DuckDB's own max_execution_time (the interrupt handler checks the query deadline / Ctrl-C)
+statement ok
+SET max_execution_time = 300;
+
+statement error
+SELECT quickjs('while (true) {}');
+----
+Query exceeded maximum execution time
+
+statement ok
+RESET max_execution_time;
+
+# The JavaScript environment has no filesystem, network, process or module access
+query I
+SELECT quickjs('[typeof require, typeof std, typeof os, typeof process, typeof fetch, typeof XMLHttpRequest].join(",")');
+----
+undefined,undefined,undefined,undefined,undefined,undefined
+
+statement error
+SELECT quickjs('import("os")');
+----
+<REGEX>:.*(could not load module|SyntaxError|not settled|module).*
+
+# ... so it keeps working when external access is disabled
+statement ok
+SET enable_external_access = false;
+
+query I
+SELECT quickjs_eval('(a, b) => a + b', 1, 2);
+----
+3

@@ -1,0 +1,30 @@
+# name: test/sql/quickjs_metadata.test
+# description: every quickjs function is documented in duckdb_functions() and the settings are registered
+# group: [quickjs]
+
+require quickjs
+
+# Every function has a description, at least one example and the 'scripting' category
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE extension_name = 'quickjs'
+  AND (description IS NULL OR description = ''
+       OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR NOT list_contains(categories, 'scripting'));
+----
+0
+
+# Scripts can call Math.random()/Date.now(): the scalar functions are VOLATILE
+query III
+SELECT function_name, function_type, stability FROM duckdb_functions()
+WHERE extension_name = 'quickjs' AND function_type = 'scalar'
+ORDER BY function_name;
+----
+quickjs	scalar	VOLATILE
+quickjs_eval	scalar	VOLATILE
+
+query IIT
+SELECT name, input_type, value FROM duckdb_settings() WHERE name LIKE 'quickjs%' ORDER BY name;
+----
+quickjs_memory_limit	VARCHAR	256MB
+quickjs_timeout_ms	BIGINT	0

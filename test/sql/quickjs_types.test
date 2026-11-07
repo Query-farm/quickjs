@@ -1,0 +1,115 @@
+# name: test/sql/quickjs_types.test
+# description: DuckDB values are passed to JavaScript as native values
+# group: [quickjs]
+
+require quickjs
+
+query IIIII
+SELECT
+  quickjs_eval('(a, b, c, d, e) => [a, b, c, d, e].map(v => typeof v)', 1::TINYINT, 2::SMALLINT, 3::INTEGER, 4::BIGINT, 5::HUGEINT),
+  quickjs_eval('(a, b, c, d) => [a, b, c, d].map(v => typeof v)', 1::UTINYINT, 2::USMALLINT, 3::UINTEGER, 4::UBIGINT),
+  quickjs_eval('(a, b, c) => [a, b, c].map(v => typeof v)', 1.5::FLOAT, 2.5::DOUBLE, 3.25::DECIMAL(10, 2)),
+  quickjs_eval('(a, b) => [typeof a, typeof b]', true, 'x'),
+  quickjs_eval('(x) => x', 12.50::DECIMAL(5, 2));
+----
+["number","number","number","number","number"]	["number","number","number","number"]	["number","number","number"]	["boolean","string"]	12.5
+
+# Integers beyond Number.MAX_SAFE_INTEGER become BigInt so no digits are lost
+query IIII
+SELECT
+  quickjs_eval('(x) => typeof x', 9007199254740993::BIGINT),
+  quickjs_eval('(x) => x', 9007199254740993::BIGINT),
+  quickjs_eval('(x) => x + 1n', -9007199254740993::BIGINT),
+  quickjs_eval('(x) => typeof x', 9007199254740991::BIGINT);
+----
+"bigint"	9007199254740993	-9007199254740992	"number"
+
+query II
+SELECT quickjs_eval('(x) => x', 18446744073709551615::UBIGINT), quickjs_eval('(x) => x * 2n', 170141183460469231731687303715884105727::HUGEINT);
+----
+18446744073709551615	340282366920938463463374607431768211454
+
+# BigInt results serialize as JSON numbers
+query I
+SELECT quickjs_eval('() => [2n ** 70n]');
+----
+[1180591620717411303424]
+
+query I
+SELECT * FROM quickjs('[2n ** 64n]');
+----
+18446744073709551616
+
+# Nested types: LIST/ARRAY -> array, STRUCT/MAP -> object, UNION -> the active member
+query IIII
+SELECT
+  quickjs_eval('(l) => l.map(x => x * x)', [1, 2, 3]),
+  quickjs_eval('(a) => Array.isArray(a) && a.length', [1, 2]::INTEGER[2]),
+  quickjs_eval('(s) => s.name + ":" + s.tags.join("|")', {'name': 'duck', 'tags': ['a', 'b']}),
+  quickjs_eval('(m) => m', MAP {'k': 1, 'j': 2});
+----
+[1,4,9]	2	"duck:a|b"	{"k":1,"j":2}
+
+query II
+SELECT quickjs_eval('(u) => u', union_value(n := 3)), quickjs_eval('(l) => l', [[1, NULL], NULL, []]);
+----
+3	[[1,null],null,[]]
+
+# A struct field called __proto__ is an ordinary own property
+query I
+SELECT quickjs_eval('(s) => Object.keys(s)', {'__proto__': 1, 'b': 2});
+----
+["__proto__","b"]
+
+# DATE and TIMESTAMP* -> Date (UTC, millisecond precision); infinite values stay strings
+query IIII
+SELECT
+  quickjs_eval('(d) => d instanceof Date && d.toISOString()', DATE '2024-02-29'),
+  quickjs_eval('(d) => d.toISOString()', TIMESTAMP '2024-01-02 03:04:05.678'),
+  quickjs_eval('(d) => d.toISOString()', TIMESTAMPTZ '2024-01-01 00:00:00+05'),
+  quickjs_eval('(d) => typeof d', 'infinity'::DATE);
+----
+"2024-02-29T00:00:00.000Z"	"2024-01-02T03:04:05.678Z"	"2023-12-31T19:00:00.000Z"	"string"
+
+query III
+SELECT
+  quickjs_eval('(d) => d.getTime()', '2024-01-01 00:00:01'::TIMESTAMP_S),
+  quickjs_eval('(d) => d.getTime()', '2024-01-01 00:00:00.123'::TIMESTAMP_MS),
+  quickjs_eval('(d) => d.getTime()', '2024-01-01 00:00:00.123456789'::TIMESTAMP_NS);
+----
+1704067201000	1704067200123	1704067200123
+
+# BLOB -> Uint8Array
+query II
+SELECT quickjs_eval('(b) => b instanceof Uint8Array && Array.from(b)', '\x00\xFFab'::BLOB), quickjs_eval('(b) => b.length', ''::BLOB);
+----
+[0,255,97,98]	0
+
+# Everything else arrives as its string form
+query III
+SELECT
+  quickjs_eval('(x) => x', 'a'::ENUM('a', 'b')),
+  quickjs_eval('(x) => x', '1 day'::INTERVAL),
+  quickjs_eval('(x) => x', '00000000-0000-0000-0000-000000000001'::UUID);
+----
+"a"	"1 day"	"00000000-0000-0000-0000-000000000001"
+
+# Table function parameters use the same conversion
+query I
+SELECT * FROM quickjs('arg0.map(x => x + arg1)', [1, 2, 3], 10::SMALLINT);
+----
+11
+12
+13
+
+query I
+SELECT * FROM quickjs('[parsed_arg0.a, arg0 instanceof Object]', {'a': 5});
+----
+5
+true
+
+# Unicode round-trips
+query II
+SELECT quickjs('"日本語".length'), quickjs_eval('(s) => [...s].reverse().join("")', 'añb🦆');
+----
+3	"🦆bña"

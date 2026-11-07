@@ -1,0 +1,150 @@
+# name: test/sql/quickjs_regressions.test
+# description: inputs that used to crash the process or produce wrong results
+# group: [quickjs]
+
+require quickjs
+
+# A Symbol result cannot be converted to a string (JS_ToCString returned NULL -> SEGV)
+statement error
+SELECT quickjs('Symbol()');
+----
+cannot convert symbol to string
+
+# Throwing a Symbol (ThrowJSException built std::string(nullptr))
+statement error
+SELECT quickjs_eval('() => { throw Symbol() }');
+----
+uncaught JavaScript exception
+
+statement error
+SELECT * FROM quickjs('(() => { throw Symbol("x") })()');
+----
+uncaught JavaScript exception
+
+# Symbols inside a JSON result are simply dropped / NULL, as JSON.stringify does
+query I
+SELECT quickjs_eval('() => Symbol()') IS NULL;
+----
+true
+
+# Unbounded recursion must raise an error, not overflow the native thread stack
+statement error
+SELECT quickjs('function f() { return f() + 1 }; f()');
+----
+Maximum call stack size exceeded
+
+statement error
+SELECT quickjs(i::VARCHAR || '; function f() { return f() + 1 }; f()') FROM range(3) t(i);
+----
+Maximum call stack size exceeded
+
+statement error
+SELECT quickjs_eval('(function f(n) { return f(n + 1) })', 1);
+----
+Maximum call stack size exceeded
+
+statement error
+SELECT * FROM quickjs('(function f() { return f() })()');
+----
+Maximum call stack size exceeded
+
+# Deeply nested source text, JSON input and JSON output
+statement error
+SELECT quickjs(repeat('[', 100000));
+----
+Maximum call stack size exceeded
+
+statement error
+SELECT * FROM quickjs('JSON.parse("[".repeat(100000) + "]".repeat(100000))');
+----
+Maximum call stack size exceeded
+
+statement error
+SELECT quickjs_eval('(n) => { let a = []; for (let i = 0; i < n; i++) a = [a]; return a }', 100000);
+----
+Maximum call stack size exceeded
+
+# The process is still healthy afterwards
+query I
+SELECT quickjs('1 + 1');
+----
+2
+
+# undefined has no JSON form: quickjs_eval returns SQL NULL instead of the text 'undefined'
+query I
+SELECT quickjs_eval('() => undefined') IS NULL;
+----
+true
+
+query I
+SELECT quickjs_eval('() => {}') IS NULL;
+----
+true
+
+query I
+SELECT quickjs_eval('() => (function () {})') IS NULL;
+----
+true
+
+query I
+SELECT quickjs_eval('() => null');
+----
+null
+
+# SMALLINT/TINYINT/DECIMAL arguments used to arrive as strings ('1' + 1 = '11')
+query III
+SELECT quickjs_eval('(x) => x + 1', 1::SMALLINT), quickjs_eval('(x) => x + 1', 1::TINYINT), quickjs_eval('(a, b) => a + b', 3.5, 2);
+----
+2	2	5.5
+
+# Strings with NUL bytes are no longer truncated
+query I
+SELECT quickjs_eval('(s) => s.length', 'a' || chr(0) || 'b');
+----
+3
+
+# Table function: a non-JSON string argument no longer fails in JSON.parse
+query I
+SELECT * FROM quickjs('[arg0]', 'hello');
+----
+"hello"
+
+query I
+SELECT * FROM quickjs('[typeof parsed_arg0, parsed_arg0]', 'not json');
+----
+"string"
+"not json"
+
+# Table function: multi-statement scripts work (the completion value is the result)
+query I
+SELECT * FROM quickjs('let a = [1, 2]; a.push(arg0); a', 3);
+----
+1
+2
+3
+
+query I
+SELECT * FROM quickjs('const xs = []; for (let i = 0; i < 3; i++) { xs.push(i * i); } xs');
+----
+0
+1
+4
+
+# Table function: undefined elements become NULL rows
+query I
+SELECT * FROM quickjs('[1, undefined, 3]');
+----
+1
+NULL
+3
+
+# Lone surrogates are replaced with U+FFFD so DuckDB never sees invalid UTF-8
+query I
+SELECT hex(quickjs('"\uD800x"'));
+----
+EFBFBD78
+
+query I
+SELECT hex(quickjs_eval('() => "\uDFFF"')::VARCHAR);
+----
+225C756466666622
