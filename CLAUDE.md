@@ -40,7 +40,7 @@ When making changes the version should always be updated to the current date plu
 
 ## Testing
 
-Tests are in `test/sql/quickjs.test` using DuckDB's SQL test format. Run a specific test pattern:
+Tests are in `test/sql/*.test` using DuckDB's SQL test format. Run a specific test pattern:
 ```sh
 ./build/release/test/unittest "test/sql/quickjs.test"
 ```
@@ -64,15 +64,26 @@ Three SQL functions are registered:
 
 ### Key Implementation Details
 
-- Each function call creates a fresh `JSRuntime`/`JSContext` for complete state isolation
-- DuckDB types are converted to JS values via `DuckDBValueToJSValue()`
-- Table function uses bind/init/execute pattern with `QuickJSTableBindData` and `QuickJSTableGlobalState`
-- Supports both legacy (`DatabaseInstance&`) and new (`ExtensionLoader&`) DuckDB extension APIs via `DUCKDB_CPP_EXTENSION_ENTRY` preprocessor flag
+- `QuickJSEngine` wraps one `JSRuntime` with the limits: `quickjs_memory_limit` (JS_SetMemoryLimit, default 256MB),
+  `quickjs_timeout_ms` (interrupt handler deadline, default 0 = off), query interruption / `max_execution_time`
+  (the interrupt handler calls `ClientContext::BlockingInterruptCheck()` and never lets a C++ exception cross QuickJS
+  C frames), and a native stack budget measured from the real thread stack (`ComputeStackBudget()`), re-armed by
+  `BeginEvaluation()` before every `JS_Eval`/`JS_Call`. Always call `BeginEvaluation()` before running JS.
+- `quickjs(code)`: runtime cached per thread (FunctionLocalState), fresh `JSContext` per row so globals never leak.
+- `quickjs_eval(fn, ...)`: runtime + context cached per thread, the function is compiled once and recompiled only
+  when the script text changes. Arguments are converted by `VectorRowToJS()`/`ValueToJS()` (numbers, BigInt beyond
+  2^53, Date, Uint8Array, arrays, objects). `undefined` results are SQL NULL. NULL args reach JS as `null`.
+- Promises returned by any function are settled by running the job queue (`SettlePromise()`).
+- Never pass a possibly-NULL `JS_ToCString` result to std::string; always use `JSValueToString()` / `JSStringToUTF8()`
+  (also replaces lone surrogates, which QuickJS emits as invalid UTF-8).
+- Table function: arguments become globals `arg0..argN` and `parsed_arg0`; the code runs as a global script and its
+  completion value must be an array.
+- The version string lives in `QUICKJS_EXTENSION_VERSION` (keep `EXTENSION_VERSION` in extension_config.cmake equal).
 
 ### Table Function Parameter Convention
 
-- `arg0`, `arg1`, etc. - Raw parameters
-- `parsed_arg0` - First parameter parsed as JSON (for array/object inputs)
+- `arg0`, `arg1`, etc. - Raw parameters (converted like quickjs_eval arguments)
+- `parsed_arg0` - First parameter parsed as JSON when it is a string holding valid JSON, otherwise arg0 itself
 
 ## Submodule Management
 
@@ -86,6 +97,6 @@ make update
 
 ## Requirements
 
-- DuckDB 1.3.1+
-- C++11 compatible compiler
+- DuckDB 2.0 (this branch)
+- C++17 compatible compiler
 - CMake 3.16+
